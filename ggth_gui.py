@@ -14,7 +14,9 @@ from tkinter import ttk, messagebox, filedialog, scrolledtext
 
 # Updated script name for the new predictor
 SCRIPT_NAME = "unified_predictor_v8.py"
-VERSION = "2.0"
+VERSION = "2.1"
+
+DATE_HINT = "YYYY-MM-DD  (leave blank = no limit)"
 
 
 class GGTHGui(tk.Tk):
@@ -33,7 +35,7 @@ class GGTHGui(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"GGTH Predictor – Control Panel v{VERSION}")
-        self.geometry("820x650")
+        self.geometry("820x920")
         self.resizable(False, False)
 
         # State variables
@@ -54,6 +56,12 @@ class GGTHGui(tk.Tk):
         self.python_exe_var = tk.StringVar(value=sys.executable)
         self.script_path_var = tk.StringVar(value=self._default_script_path())
         self.mt5_path_var = tk.StringVar(value="")
+
+        # Date range variables (YYYY-MM-DD strings; blank = no limit)
+        self.train_start_var  = tk.StringVar(value="")
+        self.train_end_var    = tk.StringVar(value="")
+        self.predict_start_var = tk.StringVar(value="")
+        self.predict_end_var   = tk.StringVar(value="")
 
         # Load MT5 path from config
         self._load_mt5_path()
@@ -214,9 +222,71 @@ class GGTHGui(tk.Tk):
             foreground="gray",
         ).place(x=10, y=60)
 
+        # --- Date Range Settings -------------------------------------
+        date_frame = ttk.LabelFrame(self, text="Date Range Settings")
+        date_frame.place(x=10, y=405, width=800, height=165)
+
+        # ---- helper: labelled date entry + "Today" quick-fill button ----
+        def _date_row(parent, label, var, row_y, hint_text):
+            ttk.Label(parent, text=label, width=14, anchor="e").place(x=5, y=row_y)
+            entry = ttk.Entry(parent, textvariable=var, width=14)
+            entry.place(x=120, y=row_y - 2)
+            # Small "clear" button
+            ttk.Button(parent, text="✕", width=2,
+                       command=lambda v=var: v.set("")).place(x=232, y=row_y - 2, width=22)
+
+        # Row labels (left column = training, right column = prediction/backtest)
+        col1_x = 5
+        col2_x = 410
+
+        # Column headers
+        ttk.Label(date_frame, text="Training window",
+                  font=("Segoe UI", 8, "bold")).place(x=120, y=5)
+        ttk.Label(date_frame, text="Prediction / Backtest window",
+                  font=("Segoe UI", 8, "bold")).place(x=520, y=5)
+
+        # Row 1 – Start dates
+        ttk.Label(date_frame, text="Start date:", anchor="e", width=12).place(x=col1_x + 5, y=32)
+        self._train_start_entry = ttk.Entry(date_frame, textvariable=self.train_start_var, width=14)
+        self._train_start_entry.place(x=col1_x + 100, y=30)
+        ttk.Button(date_frame, text="✕", width=2,
+                   command=lambda: self.train_start_var.set("")).place(x=col1_x + 212, y=30, width=22)
+
+        ttk.Label(date_frame, text="Start date:", anchor="e", width=12).place(x=col2_x + 5, y=32)
+        self._pred_start_entry = ttk.Entry(date_frame, textvariable=self.predict_start_var, width=14)
+        self._pred_start_entry.place(x=col2_x + 100, y=30)
+        ttk.Button(date_frame, text="✕", width=2,
+                   command=lambda: self.predict_start_var.set("")).place(x=col2_x + 212, y=30, width=22)
+
+        # Row 2 – End dates
+        ttk.Label(date_frame, text="End date:", anchor="e", width=12).place(x=col1_x + 5, y=62)
+        self._train_end_entry = ttk.Entry(date_frame, textvariable=self.train_end_var, width=14)
+        self._train_end_entry.place(x=col1_x + 100, y=60)
+        ttk.Button(date_frame, text="✕", width=2,
+                   command=lambda: self.train_end_var.set("")).place(x=col1_x + 212, y=60, width=22)
+
+        ttk.Label(date_frame, text="End date:", anchor="e", width=12).place(x=col2_x + 5, y=62)
+        self._pred_end_entry = ttk.Entry(date_frame, textvariable=self.predict_end_var, width=14)
+        self._pred_end_entry.place(x=col2_x + 100, y=60)
+        ttk.Button(date_frame, text="✕", width=2,
+                   command=lambda: self.predict_end_var.set("")).place(x=col2_x + 212, y=60, width=22)
+
+        # Vertical divider hint
+        ttk.Separator(date_frame, orient="vertical").place(x=400, y=5, height=145)
+
+        # Format hint
+        ttk.Label(date_frame,
+                  text="Format: YYYY-MM-DD   |   Leave blank = no limit",
+                  foreground="gray", font=("Segoe UI", 8)).place(x=10, y=100)
+
+        ttk.Label(date_frame,
+                  text="Clean out-of-sample test: set Train End = e.g. 2023-12-31, "
+                       "Predict Start = 2024-01-01",
+                  foreground="#0055AA", font=("Segoe UI", 8)).place(x=10, y=125)
+
         # --- Run / status --------------------------------------------
         action_frame = ttk.Frame(self)
-        action_frame.place(x=10, y=405, width=800, height=40)
+        action_frame.place(x=10, y=580, width=800, height=40)
 
         ttk.Button(action_frame, text="▶ Run", command=self._on_run_clicked).place(
             x=10, y=5, width=120, height=28
@@ -238,10 +308,10 @@ class GGTHGui(tk.Tk):
 
         # --- Log window ----------------------------------------------
         log_frame = ttk.LabelFrame(self, text=f"Console Output from {SCRIPT_NAME}")
-        log_frame.place(x=10, y=450, width=800, height=190)
+        log_frame.place(x=10, y=630, width=800, height=280)
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, wrap=tk.WORD, height=9, width=105, state="disabled",
+            log_frame, wrap=tk.WORD, height=14, width=105, state="disabled",
             font=("Consolas", 9)
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -362,12 +432,38 @@ class GGTHGui(tk.Tk):
         self.update_idletasks()
 
     # ------------------------------------------------------------------
+    # Date validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_date(value: str, field_name: str) -> str:
+        """
+        Validates a YYYY-MM-DD date string. Returns the stripped string if
+        valid (or empty), raises RuntimeError with a clear message otherwise.
+        """
+        v = value.strip()
+        if not v:
+            return ""
+        import re
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            raise RuntimeError(
+                f"{field_name} must be in YYYY-MM-DD format (e.g. 2024-01-01).\n"
+                f"You entered: '{v}'"
+            )
+        # Basic range check
+        from datetime import datetime as _dt
+        try:
+            _dt.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise RuntimeError(f"{field_name} '{v}' is not a valid calendar date.")
+        return v
+
+    # ------------------------------------------------------------------
     # Building the command
     # ------------------------------------------------------------------
     def _build_command(self):
-        python_exe = self.python_exe_var.get().strip()
+        python_exe  = self.python_exe_var.get().strip()
         script_path = self.script_path_var.get().strip()
-        symbol = self.symbol_var.get().strip().upper()
+        symbol      = self.symbol_var.get().strip().upper()
 
         if not python_exe or not os.path.isfile(python_exe):
             raise RuntimeError("Python executable path is invalid.")
@@ -376,43 +472,72 @@ class GGTHGui(tk.Tk):
         if not symbol:
             raise RuntimeError("Symbol cannot be empty.")
 
-        base_cmd = [python_exe, "-u", script_path]
+        # --- Validate date fields ------------------------------------
+        train_start  = self._validate_date(self.train_start_var.get(),  "Training Start")
+        train_end    = self._validate_date(self.train_end_var.get(),    "Training End")
+        pred_start   = self._validate_date(self.predict_start_var.get(),"Predict Start")
+        pred_end     = self._validate_date(self.predict_end_var.get(),  "Predict End")
 
-        # Which real mode?
+        # Cross-field sanity checks
+        from datetime import datetime as _dt
+        if train_start and train_end:
+            if _dt.strptime(train_start, "%Y-%m-%d") >= _dt.strptime(train_end, "%Y-%m-%d"):
+                raise RuntimeError("Training Start must be earlier than Training End.")
+        if pred_start and pred_end:
+            if _dt.strptime(pred_start, "%Y-%m-%d") >= _dt.strptime(pred_end, "%Y-%m-%d"):
+                raise RuntimeError("Predict Start must be earlier than Predict End.")
+        if train_end and pred_start:
+            if _dt.strptime(pred_start, "%Y-%m-%d") < _dt.strptime(train_end, "%Y-%m-%d"):
+                # Warn but don't block – the Python script will warn too
+                import tkinter.messagebox as mb
+                mb.showwarning(
+                    "Look-Ahead Bias Warning",
+                    f"Predict Start ({pred_start}) is BEFORE Training End ({train_end}).\n\n"
+                    "This means the model has already seen the data it's predicting on, "
+                    "which will produce unrealistically good backtest results.\n\n"
+                    "For a clean out-of-sample test, set Predict Start >= Training End."
+                )
+
+        # --- Map GUI actions to CLI modes ----------------------------
         action = self.action_var.get()
-
-        # Translate GUI actions into actual CLI modes
-        if action in ("train", "train-multitf", "tune"):
-            mode = action
-        elif action == "predict-mtf-once":
-            mode = "predict-multitf"
-        elif action == "predict-mtf-cont":
-            mode = "predict-multitf"
-        elif action == "backtest":
-            mode = "backtest"
-        elif action == "safe-backtest":
-            # This would require adding the safe backtest mode to CLI
-            # For now, use regular backtest
-            mode = "backtest"
-        else:
+        mode_map = {
+            "train":          "train",
+            "train-multitf":  "train-multitf",
+            "tune":           "tune",
+            "predict-mtf-once": "predict-multitf",
+            "predict-mtf-cont": "predict-multitf",
+            "backtest":       "backtest",
+            "safe-backtest":  "safe-backtest",   # was incorrectly mapped to "backtest" before
+        }
+        if action not in mode_map:
             raise RuntimeError(f"Unknown action: {action}")
+        mode = mode_map[action]
 
+        base_cmd = [python_exe, "-u", script_path]
         cmd = base_cmd + [mode, "--symbol", symbol]
 
-        # Models selection (for train / train-multitf / predict modes)
-        models = []
-        if self.models_lstm_var.get():
-            models.append("lstm")
-        if self.models_gru_var.get():
-            models.append("gru")
-        if self.models_transformer_var.get():
-            models.append("transformer")
-        if self.models_tcn_var.get():
-            models.append("tcn")
-        if self.models_lgbm_var.get():
-            models.append("lgbm")
+        # --- Training date args (train / train-multitf only) ---------
+        if action in ("train", "train-multitf"):
+            if train_start:
+                cmd += ["--train-start", train_start]
+            if train_end:
+                cmd += ["--train-end", train_end]
 
-        # Validate at least one model selected
+        # --- Prediction / backtest date args -------------------------
+        if action in ("backtest", "safe-backtest"):
+            if pred_start:
+                cmd += ["--predict-start", pred_start]
+            if pred_end:
+                cmd += ["--predict-end", pred_end]
+
+        # --- Model selection -----------------------------------------
+        models = []
+        if self.models_lstm_var.get():        models.append("lstm")
+        if self.models_gru_var.get():         models.append("gru")
+        if self.models_transformer_var.get(): models.append("transformer")
+        if self.models_tcn_var.get():         models.append("tcn")
+        if self.models_lgbm_var.get():        models.append("lgbm")
+
         if action in ("train", "train-multitf") and not models:
             raise RuntimeError("Please select at least one model type to train.")
 
@@ -498,11 +623,11 @@ class GGTHGui(tk.Tk):
         if rc == 0:
             self._set_status("Done.", "green")
             self._append_log("\n" + "=" * 60 + "\n")
-            self._append_log("✓ Process completed successfully!\n")
+            self._append_log("[OK] Process completed successfully!\n")
         else:
             self._set_status(f"Finished with errors (code {rc}).", "red")
             self._append_log("\n" + "=" * 60 + "\n")
-            self._append_log(f"✗ Process exited with code {rc}\n")
+            self._append_log(f"[ERR] Process exited with code {rc}\n")
 
 
 if __name__ == "__main__":
