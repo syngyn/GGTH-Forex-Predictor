@@ -4,7 +4,7 @@ A machine learning system that predicts forex price movements using an ensemble 
 To install simply run the setup file and follow the instructions.
 After setup just double click run_ggth_gui.bat file.
 
-<stromg>ATTENTION - In settings for the expert advisor TURN STRATEGY TESTER MODE TO FALSE TO SEE THE PREDICTIONS DISPLAYED ON YOUR CHART!!!! </strong>
+<strong>ATTENTION - In settings for the expert advisor TURN STRATEGY TESTER MODE TO FALSE TO SEE THE PREDICTIONS DISPLAYED ON YOUR CHART!!!! </strong>
 
 IMPORTANT - for the system to work properly you need to be logged into the community portal on your Metatrader 5 platform: Click TOOLS - OPTIONS - COMMUNITY - then login.
 
@@ -15,6 +15,10 @@ When backtesting, to keep the AI from cheating you MUST train it on different da
 Then run your strategy tester for the timeframe your backtest prediction files were created on. Also be sure to change it to "Backtesting Mode = True"  in the settings when using strategy tester
 All of this can be done easily through the User interface.
 
-Everything is easy to do and can be done through the GUI
+Also, included is an expert advisor that adheres to FIFO regulations for United States traders to use.
+
+Everything is easy to do and can be done through the GUI.
+
+I'd also appreciate any feedback from anyone who tests or uses this. It would be very appredciated to get input for the upgraded system I'm going to be working on.
 
 Good Luck!!
