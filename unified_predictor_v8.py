@@ -58,6 +58,10 @@ except ImportError:
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
+# ── Refactored modules ────────────────────────────────────────────────────────
+from logger import get_logger, log_startup_banner
+from model_builders import build_dl_model, KalmanFilter, TransformerBlock, AttentionLayer
+
 
 def install_package(package_name: str, pip_name: Optional[str] = None) -> None:
     try:
@@ -94,105 +98,7 @@ tf.config.run_functions_eagerly(False)
 
 # --- Helper Classes ---
 
-class KalmanFilter:
-    def __init__(self, process_variance: float, measurement_variance: float):
-        self.q = process_variance
-        self.r = measurement_variance
-        self.x = 0.0
-        self.p = 1.0
-        self.k = 0.0
-
-    def update(self, measurement: float) -> float:
-        self.p += self.q
-        self.k = self.p / (self.p + self.r)
-        self.x += self.k * (measurement - self.x)
-        self.p = (1 - self.k) * self.p
-        return self.x
-
-
-@keras.saving.register_keras_serializable(package="Custom", name="TransformerBlock")
-class TransformerBlock(layers.Layer):
-    def __init__(self, embed_dim: int, num_heads: int, ff_dim: int, rate: float = 0.1, **kwargs):
-        super(TransformerBlock, self).__init__(**kwargs)
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.rate = rate
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
-        self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation="relu"),
-            layers.Dense(embed_dim)
-        ])
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.dropout1 = layers.Dropout(rate)
-        self.dropout2 = layers.Dropout(rate)
-
-    def call(self, inputs, training=False):
-        attn_output = self.att(inputs, inputs)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(inputs + attn_output)
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        return self.layernorm2(out1 + ffn_output)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'embed_dim': self.embed_dim,
-            'num_heads': self.num_heads,
-            'ff_dim': self.ff_dim,
-            'rate': self.rate
-        })
-        return config
-    
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-
-@keras.saving.register_keras_serializable(package="Custom", name="AttentionLayer")
-class AttentionLayer(layers.Layer):
-    """Simple attention mechanism for LSTM outputs."""
-    
-    def __init__(self, **kwargs):
-        super(AttentionLayer, self).__init__(**kwargs)
-
-    def build(self, input_shape):
-        self.W = self.add_weight(
-            name='attention_weight',
-            shape=(input_shape[-1], input_shape[-1]),
-            initializer='glorot_uniform',
-            trainable=True
-        )
-        self.b = self.add_weight(
-            name='attention_bias',
-            shape=(input_shape[-1],),
-            initializer='zeros',
-            trainable=True
-        )
-        self.u = self.add_weight(
-            name='attention_context',
-            shape=(input_shape[-1],),
-            initializer='glorot_uniform',
-            trainable=True
-        )
-        super(AttentionLayer, self).build(input_shape)
-
-    def call(self, inputs):
-        # inputs shape: (batch, timesteps, features)
-        score = tf.nn.tanh(tf.tensordot(inputs, self.W, axes=1) + self.b)
-        attention_weights = tf.nn.softmax(tf.tensordot(score, self.u, axes=1), axis=1)
-        context_vector = tf.reduce_sum(inputs * tf.expand_dims(attention_weights, -1), axis=1)
-        return context_vector
-
-    def get_config(self):
-        return super().get_config()
-    
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
+# KalmanFilter, TransformerBlock, AttentionLayer → see model_builders.py
 
 # --- Main Predictor Class ---
 
@@ -204,6 +110,8 @@ class UnifiedLSTMPredictor:
                  train_end:   Optional[str] = None,
                  predict_start: Optional[str] = None,
                  predict_end:   Optional[str] = None):
+        self.log = get_logger("ggth.predictor")
+        log_startup_banner("v8")
         self.symbol = symbol.upper()
         # --- NEW MACRO SYMBOLS ---
         self.dxy_symbol = "USDX"
@@ -269,11 +177,18 @@ class UnifiedLSTMPredictor:
 
         self.previous_predictions = {tf: None for tf in self.kalman_config.keys()}
         self.ema_alpha = 0.3
-        # Only set ensemble_weights if we have models, otherwise set empty (will be set in load_model_assets)
+        # Per-timeframe ensemble weights dict: {"1H": [...], "4H": [...], "1D": [...]}
+        # Each list has one weight per model, summing to 1.0.
+        # Keeping weights separate per timeframe lets each TF learn which model
+        # is strongest on its own horizon (e.g. LGBM on ranging 4H, TCN on trending 1D).
         if self.num_ensemble_models > 0:
-            self.ensemble_weights = [1.0 / self.num_ensemble_models] * self.num_ensemble_models
+            equal_weight = 1.0 / self.num_ensemble_models
+            self.ensemble_weights: Dict[str, List[float]] = {
+                tf_key: [equal_weight] * self.num_ensemble_models
+                for tf_key in self.kalman_config.keys()  # "1H", "4H", "1D"
+            }
         else:
-            self.ensemble_weights = []
+            self.ensemble_weights: Dict[str, List[float]] = {}
         self.prediction_history = {tf: [] for tf in self.kalman_config.keys()}
         self.ensemble_lookback = 20
         self.ensemble_learning_rate = 0.1
@@ -337,18 +252,79 @@ class UnifiedLSTMPredictor:
         
         return df_dxy, df_spx
 
+    def _detect_regime(self, df_main: pd.DataFrame) -> str:
+        """
+        Classify the current market regime from recent price action alone.
+
+        Three regimes are recognised:
+            "trending"  — price is moving directionally; trend-following models
+                          (TCN, Transformer) tend to outperform.
+            "volatile"  — short-term volatility has spiked well above its norm;
+                          all models are less reliable, but LGBM degrades least.
+            "ranging"   — low directional movement and normal vol; LGBM and
+                          mean-reversion logic holds up best.
+
+        The classification uses two simple statistics computed on the close
+        series so it requires no extra data downloads and runs in microseconds.
+
+        Args:
+            df_main: H1 OHLCV DataFrame (index = datetime, 'close' column required).
+
+        Returns:
+            One of "trending", "volatile", or "ranging".
+        """
+        try:
+            close = df_main['close']
+            if len(close) < 40:
+                return 'unknown'
+
+            log_ret = np.log(close / close.shift(1)).dropna()
+
+            # Short-term vs long-term volatility ratio
+            vol_short = log_ret.iloc[-20:].std()
+            vol_long  = log_ret.iloc[-100:].std() if len(log_ret) >= 100 else vol_short
+
+            # Normalised directional slope over the last 20 bars
+            # (mean log-return divided by short-term vol → a dimensionless Z-score)
+            mean_ret_short = log_ret.iloc[-20:].mean()
+            trend_z = (mean_ret_short / vol_short) if vol_short > 0 else 0.0
+
+            # Regime thresholds (calibrated for EURUSD H1; adjust if needed)
+            VOL_SPIKE_RATIO = 1.6   # vol_short > 1.6 × vol_long → volatile
+            TREND_Z_THRESH  = 1.2   # |trend_z| > 1.2 → trending
+
+            if vol_short > VOL_SPIKE_RATIO * vol_long:
+                regime = 'volatile'
+            elif abs(trend_z) > TREND_Z_THRESH:
+                regime = 'trending'
+            else:
+                regime = 'ranging'
+
+            print(f"   Regime detection: vol_ratio={vol_short/max(vol_long,1e-10):.2f}, "
+                  f"trend_z={trend_z:.2f} → {regime.upper()}")
+            return regime
+
+        except Exception as e:
+            print(f"   Warning: Regime detection failed ({e}), defaulting to 'unknown'")
+            return 'unknown'
+
     def get_market_context(self, df_main, df_dxy, df_spx):
         """
         Refined Intermarket Veto Logic.
         Handles missing macro data gracefully.
+        Adds 'regime' key (trending / ranging / volatile) for ensemble biasing.
         """
+        # Detect regime from price action before any macro check
+        regime = self._detect_regime(df_main)
+
         # Default return if macro data is unavailable
         default_context = {
             "veto_active": False,
             "reasons": [],
             "z_score": 0.0,
             "dxy_corr": 0.0,
-            "macro_data_available": False
+            "macro_data_available": False,
+            "regime": regime,
         }
         
         # Check if we have valid macro data
@@ -407,7 +383,8 @@ class UnifiedLSTMPredictor:
                 "reasons": veto_reasons,
                 "z_score": round(float(z_score_risk), 2),
                 "dxy_corr": round(float(current_corr), 4),
-                "macro_data_available": True
+                "macro_data_available": True,
+                "regime": regime,
             }
             
         except Exception as e:
@@ -678,116 +655,8 @@ class UnifiedLSTMPredictor:
         return X_train, y_train, X_val, y_val, final_feature_cols
 
     def _build_dl_model(self, model_type: str, input_shape: Tuple[int, int], hp: Optional[kt.HyperParameters] = None) -> Model:
-        """
-        Build a deep learning model.
-
-        Args:
-            model_type: Type of model ('lstm', 'gru', 'transformer', 'tcn')
-            input_shape: Input shape (lookback, features)
-            hp: Hyperparameters for tuning
-
-        Returns:
-            Compiled Keras model
-        """
-        # Default hyperparameters
-        lstm_units = 64
-        conv_filters = 64
-        dropout_rate = 0.3
-        learning_rate = 0.0005
-
-        # Override with tuning hyperparameters if provided
-        if hp:
-            lstm_units = hp.Int('lstm_units', 32, 128, 32)
-            conv_filters = hp.Int('conv_filters', 32, 128, 32)
-            dropout_rate = hp.Float('dropout', 0.2, 0.5, 0.1)
-            learning_rate = hp.Choice('learning_rate', [1e-3, 5e-4, 1e-4])
-
-        inputs = layers.Input(shape=input_shape)
-        x = inputs
-
-        # Build model based on type
-        if model_type == 'lstm':
-            # IMPROVED: Added attention mechanism
-            x = layers.Bidirectional(layers.LSTM(lstm_units, return_sequences=True))(x)
-            x = layers.Dropout(dropout_rate)(x)
-            x = layers.LayerNormalization()(x)
-            x = AttentionLayer()(x)  # Attention instead of GlobalAveragePooling
-            
-        elif model_type == 'gru':
-            # NEW: GRU model - lighter than LSTM, often comparable performance
-            x = layers.Bidirectional(layers.GRU(lstm_units, return_sequences=True))(x)
-            x = layers.Dropout(dropout_rate)(x)
-            x = layers.LayerNormalization()(x)
-            x = layers.Bidirectional(layers.GRU(lstm_units // 2, return_sequences=False))(x)
-            x = layers.Dropout(dropout_rate)(x)
-            
-        elif model_type == 'transformer':
-            x = TransformerBlock(embed_dim=input_shape[1], num_heads=4, ff_dim=64, rate=dropout_rate)(x)
-            x = layers.GlobalAveragePooling1D()(x)
-            
-        elif model_type == 'tcn':
-            # IMPROVED TCN architecture with residual connections and wider receptive field
-            # Problem: Original TCN had only 15-step receptive field for 60-step input
-            # Solution: Increase dilations and add residual connections
-            
-            # First block - dilation 1
-            conv1 = layers.Conv1D(filters=conv_filters, kernel_size=3, dilation_rate=1,
-                                  padding='causal')(x)
-            conv1 = layers.BatchNormalization()(conv1)
-            conv1 = layers.Activation('relu')(conv1)
-            conv1 = layers.Dropout(dropout_rate)(conv1)
-            
-            # Second block - dilation 2
-            conv2 = layers.Conv1D(filters=conv_filters, kernel_size=3, dilation_rate=2,
-                                  padding='causal')(conv1)
-            conv2 = layers.BatchNormalization()(conv2)
-            conv2 = layers.Activation('relu')(conv2)
-            conv2 = layers.Dropout(dropout_rate)(conv2)
-            
-            # Third block - dilation 4
-            conv3 = layers.Conv1D(filters=conv_filters, kernel_size=3, dilation_rate=4,
-                                  padding='causal')(conv2)
-            conv3 = layers.BatchNormalization()(conv3)
-            conv3 = layers.Activation('relu')(conv3)
-            conv3 = layers.Dropout(dropout_rate)(conv3)
-            
-            # Fourth block - dilation 8 (increases receptive field to ~30 steps)
-            conv4 = layers.Conv1D(filters=conv_filters, kernel_size=3, dilation_rate=8,
-                                  padding='causal')(conv3)
-            conv4 = layers.BatchNormalization()(conv4)
-            conv4 = layers.Activation('relu')(conv4)
-            conv4 = layers.Dropout(dropout_rate)(conv4)
-            
-            # Fifth block - dilation 16 (increases receptive field to ~60 steps)
-            conv5 = layers.Conv1D(filters=conv_filters, kernel_size=3, dilation_rate=16,
-                                  padding='causal')(conv4)
-            conv5 = layers.BatchNormalization()(conv5)
-            conv5 = layers.Activation('relu')(conv5)
-            
-            # Residual connection from input (project to same dimensions if needed)
-            if input_shape[1] != conv_filters:
-                residual = layers.Conv1D(filters=conv_filters, kernel_size=1, padding='same')(x)
-            else:
-                residual = x
-            
-            # Add residual connection
-            x = layers.Add()([conv5, residual])
-            x = layers.Activation('relu')(x)
-            
-            # Global pooling
-            x = layers.GlobalAveragePooling1D()(x)
-        else:
-            raise ValueError(f"Unknown DL model type: {model_type}")
-
-        # Output layers - consistent across all model types
-        x = layers.Dense(128, activation='relu')(x)
-        x = layers.Dropout(dropout_rate)(x)
-        x = layers.Dense(64, activation='relu')(x)  # Added extra layer for consistency
-        outputs = layers.Dense(1, activation='linear')(x)
-
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=Adam(learning_rate=learning_rate), loss='huber', metrics=['mae'])
-        return model
+        """Delegate to model_builders.build_dl_model — see model_builders.py for architectures."""
+        return build_dl_model(model_type, input_shape, hp)
 
     def tune_hyperparameters(self) -> None:
         """Run hyperparameter tuning for deep learning models."""
@@ -1184,7 +1053,11 @@ class UnifiedLSTMPredictor:
                 print("Error: No trained models found. Please run the 'train' command first.")
                 return False
             self.num_ensemble_models = len(self.ensemble_model_types)
-            self.ensemble_weights = [1.0 / self.num_ensemble_models] * self.num_ensemble_models
+            equal_weight = 1.0 / self.num_ensemble_models
+            self.ensemble_weights = {
+                tf_key: [equal_weight] * self.num_ensemble_models
+                for tf_key in self.kalman_config.keys()
+            }
             print(f"Detected trained models: {self.ensemble_model_types}")
 
         try:
@@ -1492,6 +1365,69 @@ class UnifiedLSTMPredictor:
         ext = 'keras' if model_type in ['lstm', 'gru', 'transformer', 'tcn'] else 'pkl'
         return os.path.join(self.base_path, f"model_{self.symbol}_{model_type}_{index}.{ext}")
 
+    def _apply_regime_bias(
+        self,
+        base_weights: List[float],
+        model_names: List[str],
+        regime: str,
+    ) -> List[float]:
+        """
+        Multiply base ensemble weights by regime-specific per-model scalars,
+        then renormalise so the result still sums to 1.0.
+
+        The intuition behind the bias table:
+            trending  — TCN and Transformer capture long-range directional
+                        structure well; LGBM treats each bar as i.i.d. and
+                        misses momentum, so it gets a mild penalty.
+            ranging   — LGBM excels at mean-reversion because decision trees
+                        have no assumption of temporal order.  TCN/Transformer
+                        can overfit to spurious trends, so they get down-weighted.
+            volatile  — All deep models are hurt by distributional shift; LGBM
+                        is slightly more robust.  Dampen everything a little and
+                        let LGBM lead.
+            unknown   — No bias; keep whatever base_weights are.
+
+        The scalar values are intentionally conservative (range 0.8–1.3) so
+        the regime can nudge but not override learned accuracy weights.  Tune
+        on your own backtest data once you have enough evaluated predictions.
+
+        Args:
+            base_weights: Current per-TF weight vector (already accuracy-weighted).
+            model_names:  Names of each model in the same order as base_weights
+                          (e.g. ["lstm_0", "transformer_1", "lgbm_2"]).
+            regime:       Output of _detect_regime().
+
+        Returns:
+            Renormalised weight list of the same length.
+        """
+        REGIME_BIAS: Dict[str, Dict[str, float]] = {
+            'trending': {
+                'lstm': 1.1, 'gru': 1.0, 'transformer': 1.3, 'tcn': 1.3, 'lgbm': 0.8
+            },
+            'ranging': {
+                'lstm': 1.0, 'gru': 1.0, 'transformer': 0.8, 'tcn': 0.8, 'lgbm': 1.3
+            },
+            'volatile': {
+                'lstm': 0.9, 'gru': 0.9, 'transformer': 0.8, 'tcn': 0.8, 'lgbm': 1.2
+            },
+        }
+
+        bias_map = REGIME_BIAS.get(regime, {})
+        if not bias_map:
+            return base_weights  # 'unknown' or unrecognised regime — no change
+
+        biased = []
+        for w, name in zip(base_weights, model_names):
+            # Extract model type from names like "lstm_0", "transformer_1", "lgbm_2"
+            model_type = name.split('_')[0] if '_' in name else name
+            scalar = bias_map.get(model_type, 1.0)
+            biased.append(w * scalar)
+
+        total = sum(biased)
+        if total <= 0:
+            return base_weights  # safety: don't zero out all weights
+        return [b / total for b in biased]
+
     def run_prediction_cycle(self):
         """Updated with Macro integration."""
         print(f"\n--- Single-Timeframe Prediction Cycle: {self.symbol} ---")
@@ -1629,7 +1565,17 @@ class UnifiedLSTMPredictor:
             print(f"  Predicted prices: {[f'{p:.5f}' for p in ensemble_preds]}")
 
             ensemble_predictions_map[tf_name] = ensemble_preds
-            raw_prediction = np.average(ensemble_preds, weights=self.ensemble_weights[:len(ensemble_preds)])
+            tf_weights = self.ensemble_weights.get(tf_name, [])
+            if tf_weights and len(tf_weights) >= len(ensemble_preds):
+                # Fix 4: apply regime bias before combining
+                regime = context.get('regime', 'unknown')
+                model_names = list(self.models.keys())
+                tf_weights = self._apply_regime_bias(
+                    tf_weights[:len(ensemble_preds)], model_names[:len(ensemble_preds)], regime
+                )
+                raw_prediction = np.average(ensemble_preds, weights=tf_weights)
+            else:
+                raw_prediction = np.mean(ensemble_preds)
 
             print(f"  Raw ensemble average: {raw_prediction:.5f}")
 
@@ -1679,16 +1625,30 @@ class UnifiedLSTMPredictor:
         # Log predictions for future evaluation
         self._log_prediction_for_evaluation(timeframes, ensemble_predictions_map, current_price)
 
+        # Uncertainty veto (same logic as multi-TF path — Fix 3)
+        UNCERTAINTY_THRESHOLD = 0.003
+        uncertainty_veto = any(
+            data['ensemble_std'] / current_price > UNCERTAINTY_THRESHOLD
+            for data in predictions.values()
+        )
+        if uncertainty_veto:
+            print(f"   VETO (uncertainty): ensemble std exceeds {UNCERTAINTY_THRESHOLD*100:.1f}% threshold")
+
         # Save predictions and status
         status = {
             'last_update': datetime.now().isoformat(),
             'status': 'online',
             'symbol': self.symbol,
             'current_price': round(current_price, 5),
-            'ensemble_weights': [round(w, 3) for w in self.ensemble_weights],
+            'ensemble_weights': {
+                tf_key: [round(w, 3) for w in weights]
+                for tf_key, weights in self.ensemble_weights.items()
+            },
             'price': df_h1['close'].iloc[-1],
             'market_context': context,
-            'trade_allowed': not context['veto_active']
+            'regime': context.get('regime', 'unknown'),
+            'uncertainty_veto': uncertainty_veto,
+            'trade_allowed': not context['veto_active'] and not uncertainty_veto
         }
 
         self.save_to_file(self.predictions_file, predictions)
@@ -1804,12 +1764,25 @@ class UnifiedLSTMPredictor:
                 print(f"ERROR: No valid predictions for {tf_name}")
                 continue
 
-            # Average ensemble predictions
-            raw_prediction = np.mean(ensemble_preds)
+            # Weighted ensemble average using per-timeframe weights (Fix 1 & 2).
+            # Falls back to a plain mean only if the weight vector length mismatches
+            # the number of predictions that actually came back (e.g. a model failed).
+            tf_weights = self.ensemble_weights.get(tf_name, [])
+            if tf_weights and len(tf_weights) == len(ensemble_preds):
+                # Fix 4: bias the accuracy-learned weights toward regime-appropriate models
+                regime = context.get('regime', 'unknown')
+                model_names = list(models.keys())  # same order as ensemble_preds
+                tf_weights = self._apply_regime_bias(tf_weights, model_names, regime)
+                raw_prediction = np.average(ensemble_preds, weights=tf_weights)
+                weight_info = (f"weights={[f'{w:.3f}' for w in tf_weights]} "
+                               f"[regime={regime}]")
+            else:
+                raw_prediction = np.mean(ensemble_preds)
+                weight_info = "weights=equal (fallback — count mismatch)"
 
             print(f"\n{tf_name}:")
             print(f"  Ensemble predictions: {[f'{p:.5f}' for p in ensemble_preds]}")
-            print(f"  Average: {raw_prediction:.5f}")
+            print(f"  Weighted average: {raw_prediction:.5f} ({weight_info})")
 
             # Apply smoothing
             raw_log_return = np.log(raw_prediction / current_price)
@@ -1849,15 +1822,61 @@ class UnifiedLSTMPredictor:
                 'ensemble_std': round(np.std(ensemble_preds), 5)
             }
 
-        # Save predictions
+        # ── Fix 3: Uncertainty veto ────────────────────────────────────────────
+        # When the ensemble models strongly disagree on a given bar their
+        # individual predictions scatter widely.  A high relative std is a
+        # signal that the bar is ambiguous; we block trading rather than
+        # pick a direction arbitrarily.
+        UNCERTAINTY_THRESHOLD = 0.003  # 0.3 % of current price
+        uncertainty_veto = False
+        for tf_key, tf_data in predictions.items():
+            rel_std = tf_data['ensemble_std'] / current_price
+            if rel_std > UNCERTAINTY_THRESHOLD:
+                uncertainty_veto = True
+                print(f"   VETO (uncertainty): {tf_key} relative std={rel_std*100:.3f}% "
+                      f"exceeds threshold {UNCERTAINTY_THRESHOLD*100:.1f}%")
+
+        # ── Fix 5: Cross-timeframe directional agreement ───────────────────────
+        # If the three timeframes are not pointing in the same direction the
+        # signal is split and conviction is low.  Require at least 2/3 agreement.
+        if len(predictions) >= 2:
+            directions = [
+                1 if data['prediction'] > current_price else -1
+                for data in predictions.values()
+            ]
+            agreement_score = abs(sum(directions)) / len(directions)
+            print(f"   Directional agreement score: {agreement_score:.2f} "
+                  f"(1.0=full, 0.33=split)")
+            agreement_veto = agreement_score < 0.67
+            if agreement_veto:
+                print(f"   VETO (agreement): timeframes disagree on direction "
+                      f"({agreement_score:.2f} < 0.67)")
+        else:
+            agreement_score = 1.0
+            agreement_veto = False
+
+        trade_allowed = (
+            not context['veto_active']
+            and not uncertainty_veto
+            and not agreement_veto
+        )
+
+        # Save predictions and status
         status = {
             'last_update': datetime.now().isoformat(),
             'status': 'online',
             'symbol': self.symbol,
             'current_price': round(current_price, 5),
             'method': 'multi-timeframe',
+            'ensemble_weights': {
+                tf_key: [round(w, 3) for w in weights]
+                for tf_key, weights in self.ensemble_weights.items()
+            },
             'market_context': context,
-            'trade_allowed': not context['veto_active']
+            'agreement_score': round(agreement_score, 3),
+            'uncertainty_veto': uncertainty_veto,
+            'agreement_veto': agreement_veto,
+            'trade_allowed': trade_allowed
         }
 
         self.save_to_file(self.predictions_file, predictions)
@@ -1948,18 +1967,27 @@ class UnifiedLSTMPredictor:
             json.dump(remaining_evals, f, indent=2)
 
     def update_ensemble_weights(self) -> None:
-        """Update ensemble weights based on past performance."""
+        """
+        Update per-timeframe ensemble weights based on past prediction accuracy.
+
+        Each timeframe (1H, 4H, 1D) maintains its own weight vector so that
+        a model that excels on 1H but is mediocre on 1D gets rewarded
+        independently for each horizon.  Previously a single shared list was
+        updated by mixing errors across all timeframes, which muddied the
+        signal — that bug is fixed here.
+        """
         if not self.ensemble_weights:
             return
 
-        print("Updating ensemble weights...")
-        model_errors = [0.0] * self.num_ensemble_models
-        total_samples = 0
+        print("Updating per-timeframe ensemble weights...")
 
-        # Calculate average error for each model
-        for tf_history in self.prediction_history.values():
+        for tf_name, tf_history in self.prediction_history.items():
             if not tf_history:
                 continue
+
+            model_errors = [0.0] * self.num_ensemble_models
+            total_samples = 0
+
             for entry in tf_history:
                 actual = entry['actual']
                 for i, pred in enumerate(entry['predictions']):
@@ -1967,42 +1995,46 @@ class UnifiedLSTMPredictor:
                         model_errors[i] += abs(pred - actual)
                 total_samples += 1
 
-        if total_samples < 5:
-            print("   Not enough evaluated predictions to update weights.")
-            return
+            if total_samples < 5:
+                print(f"   {tf_name}: Not enough evaluated predictions ({total_samples}/5 minimum).")
+                continue
 
-        # Better handling of zero division
-        avg_errors = [err / max(total_samples, 1) for err in model_errors]
-        
-        # FIXED: Use softmax-style weighting to prevent extreme weights
-        # This prevents any single model from dominating
-        min_error = min(avg_errors) if avg_errors else 1e-8
-        normalized_errors = [(err / min_error) for err in avg_errors]
-        
-        # Apply temperature scaling to control weight distribution
-        temperature = 2.0  # Higher = more equal weights, lower = more extreme
-        exp_neg_errors = [np.exp(-err / temperature) for err in normalized_errors]
-        total_exp = sum(exp_neg_errors)
+            avg_errors = [err / max(total_samples, 1) for err in model_errors]
 
-        if total_exp == 0:
-            print("   WARNING: All weights are zero, keeping equal weights")
-            return
+            # Softmax-style weighting: normalise by the best error then apply
+            # temperature scaling to prevent any single model from dominating.
+            min_error = min(avg_errors) if avg_errors else 1e-8
+            normalized_errors = [err / max(min_error, 1e-8) for err in avg_errors]
 
-        new_weights = [e / total_exp for e in exp_neg_errors]
+            temperature = 2.0  # higher → more equal weights; lower → winner-takes-more
+            exp_neg_errors = [np.exp(-err / temperature) for err in normalized_errors]
+            total_exp = sum(exp_neg_errors)
 
-        # Smooth weight updates
-        self.ensemble_weights = [
-            (1 - self.ensemble_learning_rate) * old_w + self.ensemble_learning_rate * new_w
-            for old_w, new_w in zip(self.ensemble_weights, new_weights)
-        ]
+            if total_exp == 0:
+                print(f"   {tf_name}: WARNING: all softmax weights are zero — keeping current weights.")
+                continue
 
-        # Normalize weights (just in case)
-        weight_sum = sum(self.ensemble_weights)
-        if weight_sum > 0:
-            self.ensemble_weights = [w / weight_sum for w in self.ensemble_weights]
+            new_weights = [e / total_exp for e in exp_neg_errors]
 
-        print(f"   Avg errors: {[f'{e:.6f}' for e in avg_errors]}")
-        print(f"   New weights: {[f'{w:.3f}' for w in self.ensemble_weights]}")
+            # Smooth update (exponential moving average over weight updates)
+            current_weights = self.ensemble_weights.get(
+                tf_name,
+                [1.0 / self.num_ensemble_models] * self.num_ensemble_models
+            )
+            updated_weights = [
+                (1 - self.ensemble_learning_rate) * old_w + self.ensemble_learning_rate * new_w
+                for old_w, new_w in zip(current_weights, new_weights)
+            ]
+
+            # Re-normalise (float arithmetic can shift the sum slightly off 1.0)
+            weight_sum = sum(updated_weights)
+            if weight_sum > 0:
+                updated_weights = [w / weight_sum for w in updated_weights]
+
+            self.ensemble_weights[tf_name] = updated_weights
+
+            print(f"   {tf_name} - Avg MAE per model: {[f'{e:.6f}' for e in avg_errors]}")
+            print(f"   {tf_name} - Updated weights:   {[f'{w:.3f}' for w in updated_weights]}")
 
     def run_safe_backtest(self):
         """
@@ -2153,8 +2185,12 @@ class UnifiedLSTMPredictor:
                                 continue
                 
                 if ensemble_preds:
-                    weighted_price = np.mean(ensemble_preds)
-                    
+                    tf_weights = self.ensemble_weights.get(tf_name, [])
+                    if tf_weights and len(tf_weights) == len(ensemble_preds):
+                        weighted_price = np.average(ensemble_preds, weights=tf_weights)
+                    else:
+                        weighted_price = np.mean(ensemble_preds)
+
                     # Get actual future price (if available)
                     future_idx = min(current_idx + steps, len(df_selected) - 1)
                     actual_price = df_selected['close'].iloc[future_idx]
@@ -2351,7 +2387,11 @@ class UnifiedLSTMPredictor:
                             continue
 
                 if ensemble_preds:
-                    weighted_price = np.mean(ensemble_preds)
+                    tf_weights = self.ensemble_weights.get(tf_name, [])
+                    if tf_weights and len(tf_weights) == len(ensemble_preds):
+                        weighted_price = np.average(ensemble_preds, weights=tf_weights)
+                    else:
+                        weighted_price = np.mean(ensemble_preds)
                     all_predictions[tf_name].append(weighted_price)
                 else:
                     all_predictions[tf_name].append(current_price)
