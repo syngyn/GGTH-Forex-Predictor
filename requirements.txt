@@ -1,30 +1,39 @@
-# GGTH Predictor Requirements v2.1
-# Updated for unified_predictor_v8.py with version pinning
+# GGTH Predictor Requirements v2.3
+# Python: 3.9, 3.10, or 3.11  (3.12+ not supported by tensorflow==2.15.0)
+# Updated: 2026 — added protobuf and scipy pins
 
-# Core ML/Data libraries
+# ── Core data libraries ───────────────────────────────────────────────────────
 numpy>=1.23.5,<2.0.0
-pandas>=1.3.0
-scikit-learn>=1.0.0
+pandas>=1.3.0,<3.0.0
+scikit-learn>=1.0.0,<2.0.0
 
-# Deep Learning - PINNED VERSIONS to prevent compatibility issues
+# ── Deep Learning (STRICT — do not loosen these) ──────────────────────────────
+# Models are serialized with keras 2.15. Loading with a different version
+# will raise "Cannot deserialize" errors. Retrain from scratch if you upgrade.
 tensorflow==2.15.0
 keras==2.15.0
 
-# Gradient Boosting
-lightgbm>=3.3.0
+# TF 2.15 requires protobuf<4.0. Without this pin, pip can silently install
+# protobuf 4.x or 5.x, breaking model serialization with a confusing import
+# error that gives no indication the real cause is a protobuf version mismatch.
+protobuf>=3.19.0,<4.0.0
 
-# Hyperparameter tuning
-keras-tuner>=1.1.0
+# ── Gradient boosting ─────────────────────────────────────────────────────────
+lightgbm>=3.3.0,<5.0.0
 
-# MetaTrader 5 integration
+# ── Hyperparameter tuning ─────────────────────────────────────────────────────
+keras-tuner>=1.1.0,<1.5.0
+
+# ── MetaTrader 5 integration ──────────────────────────────────────────────────
+# No upper bound — MT5 versions track the broker platform, not a public API
 MetaTrader5>=5.0.37
 
-# Hidden Markov Models (for market regime detection)
-hmmlearn>=0.2.7
+# ── Market regime detection ───────────────────────────────────────────────────
+hmmlearn>=0.3.0,<0.4.0
 
-# Note: tkinter is included with Python standard library
-# If missing on Linux: sudo apt-get install python3-tk
+# hmmlearn depends on scipy but does not pin it, so a scipy version mismatch
+# can silently break regime detection at runtime. Pinned explicitly here.
+scipy>=1.7.0,<2.0.0
 
-# IMPORTANT: These exact versions prevent model loading errors
-# If you get "Cannot deserialize" errors, your models were trained
-# with a different version. Solution: Retrain with these versions.
+# ── Note: tkinter ─────────────────────────────────────────────────────────────
+# Included with Python on Windows. Missing on Linux: sudo apt-get install python3-tk

@@ -457,78 +457,223 @@ class UnifiedLSTMPredictor:
 
     def create_features(self, df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_d1: pd.DataFrame) -> pd.DataFrame:
         """
-        Create advanced features for model training.
+        Create a rich multi-timeframe feature set for model training.
+
+        Feature groups
+        --------------
+        H1 momentum   : log returns (1h / 4h / 1d / 1w) + 5 lagged 1h returns
+        H1 volatility : ATR-14, rolling std-14, rolling std-30, vol ratio, BB width/%B
+        H1 trend      : SMA-10/20/50, price-to-SMA ratios, SMA crossover ratio,
+                        MACD line/signal/hist, ADX-14 with +DI / -DI
+        H1 oscillators: RSI-7/14, Stochastic %K/%D
+        H4 (reindexed): SMA-20/50, RSI-14, ATR-14, MACD hist,
+                        price-to-SMA-20 ratio
+        D1 (reindexed): SMA-20/50, RSI-14, price-to-SMA-20 ratio
+        Volume/spread : tick volume (H1), spread (when available)
+        Time          : hour sin/cos, day-of-week sin/cos,
+                        London session flag, NY session flag,
+                        London-NY overlap flag
+        Targets       : fwd_log_return_1h / 4h / 1d  (excluded from feature cols)
+
+        All indicators are computed with EWM (Wilder smoothing) where applicable
+        so they match the definitions used in most professional platforms.
+        OHLC raw prices are retained in the DataFrame for target computation but
+        are excluded from the feature selection candidate pool in
+        perform_feature_selection().
 
         Args:
-            df_h1: H1 timeframe data
-            df_h4: H4 timeframe data
-            df_d1: D1 timeframe data
+            df_h1: H1 OHLCV DataFrame  (index = datetime, renamed tick_volume → volume)
+            df_h4: H4 OHLCV DataFrame
+            df_d1: D1 OHLCV DataFrame
 
         Returns:
-            DataFrame with engineered features
+            DataFrame aligned to the H1 index with all features + targets.
         """
         print("Creating advanced features...")
         df = df_h1.copy()
 
-        # Multi-timeframe features
-        df['sma_20_h4'] = df_h4['close'].rolling(window=20).mean().reindex(df.index, method='ffill')
-        df['sma_20_d1'] = df_d1['close'].rolling(window=20).mean().reindex(df.index, method='ffill')
+        # ── Local indicator helpers ────────────────────────────────────────────
+        # All helpers operate on plain pd.Series / DataFrames and return Series.
+        # Using EWM with adjust=False approximates Wilder's smoothing (span = period).
 
-        # RSI calculation
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        df['rsi_14_h1'] = 100 - (100 / (1 + (gain / (loss + 1e-8))))
+        def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+            delta = close.diff()
+            gain  = delta.where(delta > 0, 0.0).ewm(span=period, adjust=False).mean()
+            loss  = (-delta.where(delta < 0, 0.0)).ewm(span=period, adjust=False).mean()
+            return 100 - (100 / (1 + gain / (loss + 1e-8)))
 
-        # Time-based features
-        df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-        df['dow_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+        def _atr(ohlc: pd.DataFrame, period: int = 14) -> pd.Series:
+            h, l, c = ohlc['high'], ohlc['low'], ohlc['close']
+            tr = pd.concat([h - l,
+                            (h - c.shift(1)).abs(),
+                            (l - c.shift(1)).abs()], axis=1).max(axis=1)
+            return tr.ewm(span=period, adjust=False).mean()
 
-        # Returns and volatility
-        # Backward-looking returns (used as momentum/regime FEATURES - valid inputs)
+        def _adx(ohlc: pd.DataFrame, period: int = 14):
+            """Returns (adx, plus_di, minus_di) as three Series."""
+            h, l = ohlc['high'], ohlc['low']
+            up   = h.diff()
+            down = -l.diff()
+            plus_dm  = np.where((up > down) & (up > 0),   up,   0.0)
+            minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+            atr_s    = _atr(ohlc, period)
+            plus_di  = (100 * pd.Series(plus_dm,  index=ohlc.index)
+                            .ewm(span=period, adjust=False).mean() / (atr_s + 1e-8))
+            minus_di = (100 * pd.Series(minus_dm, index=ohlc.index)
+                            .ewm(span=period, adjust=False).mean() / (atr_s + 1e-8))
+            dx  = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8))
+            adx = dx.ewm(span=period, adjust=False).mean()
+            return adx, plus_di, minus_di
+
+        def _macd(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9):
+            """Returns (macd_line, signal, histogram) as three Series."""
+            line   = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+            signal = line.ewm(span=sig, adjust=False).mean()
+            return line, signal, line - signal
+
+        def _bollinger(close: pd.Series, period: int = 20, n_std: float = 2.0):
+            """Returns (bb_width, bb_pct) — width normalised by SMA, %B in [0,1]."""
+            sma   = close.rolling(period).mean()
+            std   = close.rolling(period).std()
+            upper = sma + n_std * std
+            lower = sma - n_std * std
+            width = (upper - lower) / (sma + 1e-8)
+            pct   = (close - lower) / (upper - lower + 1e-8)
+            return width, pct
+
+        def _stochastic(ohlc: pd.DataFrame, k: int = 14, d: int = 3):
+            """Returns (%K, %D) both in [0, 100]."""
+            lo  = ohlc['low'].rolling(k).min()
+            hi  = ohlc['high'].rolling(k).max()
+            pct_k = 100 * (ohlc['close'] - lo) / (hi - lo + 1e-8)
+            return pct_k, pct_k.rolling(d).mean()
+
+        def _reindex(series: pd.Series) -> pd.Series:
+            """Forward-fill a lower-timeframe series onto the H1 index."""
+            return series.reindex(df.index, method='ffill')
+
+        # ── Backward-looking returns (momentum features — valid inputs) ────────
         df['log_return_1h'] = np.log(df['close'] / df['close'].shift(1))
         df['log_return_4h'] = np.log(df['close'] / df['close'].shift(4))
         df['log_return_1d'] = np.log(df['close'] / df['close'].shift(24))
+        df['log_return_1w'] = np.log(df['close'] / df['close'].shift(168))
 
-        df['volatility_30'] = df['log_return_1h'].rolling(30).std()
+        # Lagged 1h log-returns (give the model recent direction history)
+        for lag in [1, 2, 3, 5, 10]:
+            df[f'log_return_lag_{lag}'] = df['log_return_1h'].shift(lag)
 
-        # Forward-looking returns (TRUE PREDICTION TARGETS - what we actually want to forecast)
-        # shift(-N) means "the return that will happen over the next N bars"
-        # NaN rows at the tail are dropped by the subsequent dropna() call
-        df['fwd_log_return_1h'] = np.log(df['close'].shift(-1) / df['close'])
-        df['fwd_log_return_4h'] = np.log(df['close'].shift(-4) / df['close'])
+        # ── Volatility ────────────────────────────────────────────────────────
+        df['atr_14_h1']      = _atr(df, 14)
+        df['volatility_14']  = df['log_return_1h'].rolling(14).std()
+        df['volatility_30']  = df['log_return_1h'].rolling(30).std()
+        # Ratio of short-to-long vol: >1 → vol spike (regime signal)
+        df['vol_ratio']      = df['volatility_14'] / (df['volatility_30'] + 1e-8)
+
+        # ── Trend — SMA crossovers and price position ─────────────────────────
+        df['sma_10_h1']         = df['close'].rolling(10).mean()
+        df['sma_20_h1']         = df['close'].rolling(20).mean()
+        df['sma_50_h1']         = df['close'].rolling(50).mean()
+        df['close_sma10_ratio'] = df['close'] / (df['sma_10_h1'] + 1e-8) - 1
+        df['close_sma20_ratio'] = df['close'] / (df['sma_20_h1'] + 1e-8) - 1
+        df['close_sma50_ratio'] = df['close'] / (df['sma_50_h1'] + 1e-8) - 1
+        df['sma10_sma20_ratio'] = df['sma_10_h1'] / (df['sma_20_h1'] + 1e-8) - 1  # crossover signal
+
+        # ── MACD ──────────────────────────────────────────────────────────────
+        df['macd_line'], df['macd_signal'], df['macd_hist'] = _macd(df['close'])
+
+        # ── Bollinger Bands ───────────────────────────────────────────────────
+        df['bb_width'], df['bb_pct'] = _bollinger(df['close'], 20)
+
+        # ── RSI (fast + standard) ─────────────────────────────────────────────
+        df['rsi_7_h1']  = _rsi(df['close'], 7)
+        df['rsi_14_h1'] = _rsi(df['close'], 14)
+
+        # ── ADX (trend strength + directional components) ─────────────────────
+        df['adx_14_h1'], df['plus_di_14_h1'], df['minus_di_14_h1'] = _adx(df, 14)
+
+        # ── Stochastic ────────────────────────────────────────────────────────
+        df['stoch_k'], df['stoch_d'] = _stochastic(df, 14, 3)
+
+        # ── Volume ────────────────────────────────────────────────────────────
+        if 'volume' in df.columns:
+            vol_ma = df['volume'].rolling(20).mean()
+            df['volume_ratio'] = df['volume'] / (vol_ma + 1e-8)  # normalised vs. recent average
+
+        # ── Spread (available from MT5 rates) ─────────────────────────────────
+        if 'spread' in df.columns:
+            spread_ma = df['spread'].rolling(20).mean()
+            df['spread_ratio'] = df['spread'] / (spread_ma + 1e-8)
+
+        # ── H4 features (reindexed to H1 via forward-fill) ────────────────────
+        df['sma_20_h4']         = _reindex(df_h4['close'].rolling(20).mean())
+        df['sma_50_h4']         = _reindex(df_h4['close'].rolling(50).mean())
+        df['rsi_14_h4']         = _reindex(_rsi(df_h4['close'], 14))
+        df['atr_14_h4']         = _reindex(_atr(df_h4, 14))
+        _, _, macd_hist_h4      = _macd(df_h4['close'])
+        df['macd_hist_h4']      = _reindex(macd_hist_h4)
+        df['close_sma20_h4_ratio'] = df['close'] / (_reindex(df_h4['close'].rolling(20).mean()) + 1e-8) - 1
+
+        # ── D1 features (reindexed to H1 via forward-fill) ────────────────────
+        df['sma_20_d1']            = _reindex(df_d1['close'].rolling(20).mean())
+        df['sma_50_d1']            = _reindex(df_d1['close'].rolling(50).mean())
+        df['rsi_14_d1']            = _reindex(_rsi(df_d1['close'], 14))
+        df['close_sma20_d1_ratio'] = df['close'] / (_reindex(df_d1['close'].rolling(20).mean()) + 1e-8) - 1
+
+        # ── Time / session features ────────────────────────────────────────────
+        # Complete cyclic pairs — a sin alone carries no phase information
+        hour = df.index.hour
+        dow  = df.index.dayofweek
+        df['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+        df['dow_sin']  = np.sin(2 * np.pi * dow  / 7)
+        df['dow_cos']  = np.cos(2 * np.pi * dow  / 7)
+
+        # Session windows (UTC hours) — EURUSD volatility profile is session-driven
+        df['session_london']  = ((hour >= 7)  & (hour < 16)).astype(np.int8)
+        df['session_ny']      = ((hour >= 13) & (hour < 21)).astype(np.int8)
+        df['session_overlap'] = ((hour >= 13) & (hour < 16)).astype(np.int8)
+
+        # ── Forward-looking targets (EXCLUDED from feature cols) ──────────────
+        df['fwd_log_return_1h'] = np.log(df['close'].shift(-1)  / df['close'])
+        df['fwd_log_return_4h'] = np.log(df['close'].shift(-4)  / df['close'])
         df['fwd_log_return_1d'] = np.log(df['close'].shift(-24) / df['close'])
 
-        # Lag features
-        for lag in [1, 2, 3, 5, 10]:
-            df[f'close_lag_{lag}'] = df['close'].shift(lag)
-
-        # Clean data - remove NaN and infinite values
-        df.dropna(inplace=True)
+        # ── Clean ─────────────────────────────────────────────────────────────
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
 
         if len(df) < self.lookback_periods + 100:
-            print(f"WARNING: Only {len(df)} bars after feature creation. May not be enough for training.")
+            print(f"WARNING: Only {len(df)} bars after feature creation — may be insufficient for training.")
 
-        print(f"   Created {len(df.columns)} features from {len(df)} bars")
+        # Count candidate features (excludes raw OHLC and targets)
+        _exclude = {'open', 'high', 'low', 'close', 'volume', 'spread', 'real_volume',
+                    'fwd_log_return_1h', 'fwd_log_return_4h', 'fwd_log_return_1d'}
+        n_candidates = sum(1 for c in df.columns if c not in _exclude)
+        print(f"   Created {n_candidates} candidate features from {len(df)} bars")
         return df
 
-    def perform_feature_selection(self, df: pd.DataFrame, num_features: int = 25) -> pd.DataFrame:
+    def perform_feature_selection(self, df: pd.DataFrame, num_features: int = 30) -> pd.DataFrame:
         """
         Select most important features using LightGBM.
 
         Args:
             df: DataFrame with all features
-            num_features: Number of top features to select
+            num_features: Number of top features to select (default raised to 30
+                          to match the expanded candidate pool from create_features)
 
         Returns:
             DataFrame with selected features
         """
         print(f"Performing feature selection to find top {num_features} features...")
         target = self.target_column
-        exclude_cols = [target, 'fwd_log_return_1h', 'fwd_log_return_4h', 'fwd_log_return_1d',
-                        'log_return_4h', 'log_return_1d', 'close', 'open', 'high', 'low', 'time']
+        # Exclude forward-looking targets and raw OHLC price levels.
+        # Backward-looking log returns (log_return_4h, log_return_1d, etc.) are
+        # intentionally kept as candidate features — they carry valid momentum signal.
+        exclude_cols = {
+            target,
+            'fwd_log_return_1h', 'fwd_log_return_4h', 'fwd_log_return_1d',
+            'close', 'open', 'high', 'low',
+        }
         features = [col for col in df.columns if col not in exclude_cols]
 
         X = df[features]
@@ -1456,15 +1601,20 @@ class UnifiedLSTMPredictor:
         self._evaluate_past_predictions()
         self.update_ensemble_weights()
 
-        # Download fresh data
-        df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 300))
-        df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 300))
-        df_d1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_D1, 0, 300))
+        # Download fresh data.
+        # H1 bar count must cover the longest warmup period (log_return_1w = 168 bars)
+        # plus the sequence lookback (60) plus a safety buffer → 500 is sufficient.
+        df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 500))
+        df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 150))
+        df_d1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_D1, 0,  75))
 
-        # Validate data
+        # Validate data — minimums are per-timeframe to match the download counts above
+        _min_bars = {"H1": 250, "H4": 60, "D1": 55}
         for df, name in [(df_h1, "H1"), (df_h4, "H4"), (df_d1, "D1")]:
-            if df.empty or len(df) < 100:
-                print(f"ERROR: Insufficient {name} data for prediction")
+            required = _min_bars[name]
+            if df.empty or len(df) < required:
+                print(f"ERROR: Insufficient {name} data for prediction "
+                      f"(got {len(df) if not df.empty else 0}, need {required})")
                 return
             df['time'] = pd.to_datetime(df['time'], unit='s')
             df.set_index('time', inplace=True)
@@ -1474,6 +1624,19 @@ class UnifiedLSTMPredictor:
         # Create features
         df = self.create_features(df_h1, df_h4, df_d1)
         current_price = df['close'].iloc[-1]
+
+        # ── Feature compatibility check ────────────────────────────────────────
+        if self.feature_cols:
+            missing_cols = [c for c in self.feature_cols if c not in df.columns]
+            if missing_cols:
+                print("\n" + "!" * 70)
+                print("  FEATURE MISMATCH — saved feature list does not match current DataFrame.")
+                print(f"  Missing columns ({len(missing_cols)}): {missing_cols}")
+                print("  This happens when create_features() is updated after models were trained.")
+                print("  ACTION REQUIRED: retrain all models with:")
+                print("      python unified_predictor_v8.py train-multitf --force")
+                print("!" * 70 + "\n")
+                return
 
         # Prepare sequential input
         last_sequence_raw = df.iloc[-self.lookback_periods:][self.feature_cols].values
@@ -1683,15 +1846,21 @@ class UnifiedLSTMPredictor:
             if not self.load_model_assets_multitimeframe():
                 return
 
-        # Download fresh data
-        df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 300))
-        df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 300))
-        df_d1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_D1, 0, 300))
+        # Download fresh data.
+        # H1 bar count must cover the longest warmup period (log_return_1w = 168 bars)
+        # plus the sequence lookback (60) plus a safety buffer → 500 is sufficient.
+        # H4 and D1 only need enough for SMA-50 warmup.
+        df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 500))
+        df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 150))
+        df_d1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_D1, 0,  75))
 
-        # Validate data
+        # Validate data — minimums are per-timeframe to match the download counts above
+        _min_bars = {"H1": 250, "H4": 60, "D1": 55}
         for df, name in [(df_h1, "H1"), (df_h4, "H4"), (df_d1, "D1")]:
-            if df.empty or len(df) < 100:
-                print(f"ERROR: Insufficient {name} data")
+            required = _min_bars[name]
+            if df.empty or len(df) < required:
+                print(f"ERROR: Insufficient {name} data "
+                      f"(got {len(df) if not df.empty else 0}, need {required})")
                 return
             df['time'] = pd.to_datetime(df['time'], unit='s')
             df.set_index('time', inplace=True)
@@ -1701,6 +1870,22 @@ class UnifiedLSTMPredictor:
         # Create features
         df = self.create_features(df_h1, df_h4, df_d1)
         current_price = df['close'].iloc[-1]
+
+        # ── Feature compatibility check ────────────────────────────────────────
+        # self.feature_cols was saved during training. If create_features() has
+        # been updated since then the column names may no longer match, producing
+        # a cryptic pandas KeyError. Catch it here with an actionable message.
+        if self.feature_cols:
+            missing_cols = [c for c in self.feature_cols if c not in df.columns]
+            if missing_cols:
+                print("\n" + "!" * 70)
+                print("  FEATURE MISMATCH — saved feature list does not match current DataFrame.")
+                print(f"  Missing columns ({len(missing_cols)}): {missing_cols}")
+                print("  This happens when create_features() is updated after models were trained.")
+                print("  ACTION REQUIRED: retrain all models with:")
+                print("      python unified_predictor_v8.py train-multitf --force")
+                print("!" * 70 + "\n")
+                return
 
         predictions = {}
 

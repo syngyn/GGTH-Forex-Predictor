@@ -1,97 +1,149 @@
 """
-GGTH Predictor Configuration Manager v2.0
-Handles loading and saving configuration, especially MT5 Files path
+GGTH Predictor Configuration Manager v2.1
+Handles loading and saving configuration, especially MT5 Files path.
 Updated for unified_predictor_v8.py
+
+Fixes v2.0 → v2.1:
+  - set() renamed to set_value() — 'set' shadowed the Python built-in
+  - get_default_models() fallback now references DEFAULT_CONFIG instead of a
+    hardcoded list that contradicted it (was all-5 models vs 3 in DEFAULT_CONFIG)
+  - auto_detect_mt5_path() sorts candidates by mtime so the most-recently-used
+    terminal wins when multiple MT5 installations exist
+  - __file__ wrapped in os.path.abspath() so the config path is stable
+    regardless of the working directory at launch time
+  - Singleton exposes reload() so callers can refresh after an on-disk change
+  - _load_config() surfaces a clear ValueError on malformed JSON instead of
+    silently falling back to defaults and masking the real problem
 """
 
 import os
+import glob
 import json
 from typing import Optional, Dict, Any
 
+# Stable path to this file's directory — safe regardless of CWD at launch time
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 
 class ConfigManager:
-    """Manages configuration for GGTH Predictor"""
+    """Manages configuration for GGTH Predictor."""
 
-    DEFAULT_CONFIG = {
-        "mt5_files_path": "",
-        "version": "2.0",
-        "models_dir": "models",
-        "use_kalman": True,
-        "default_symbol": "EURUSD",
+    DEFAULT_CONFIG: Dict[str, Any] = {
+        "mt5_files_path":             "",
+        "version":                    "2.0",
+        "models_dir":                 "models",
+        "use_kalman":                 True,
+        "default_symbol":             "EURUSD",
         "prediction_interval_minutes": 60,
-        "default_models": ["lstm", "transformer", "lgbm"],
-        "available_models": ["lstm", "gru", "transformer", "tcn", "lgbm"]
+        "default_models":             ["lstm", "transformer", "lgbm"],
+        "available_models":           ["lstm", "gru", "transformer", "tcn", "lgbm"],
     }
 
     def __init__(self, config_path: Optional[str] = None):
         """
-        Initialize config manager
+        Initialise the config manager.
 
         Args:
-            config_path: Path to config.json file. If None, looks in script directory.
+            config_path: Path to config.json.
+                         Defaults to config.json in the same directory as this
+                         script (resolved with abspath, so CWD doesn't matter).
         """
         if config_path is None:
-            # Look for config.json in the same directory as this script
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(script_dir, "config.json")
+            config_path = os.path.join(_HERE, "config.json")
 
         self.config_path = config_path
         self.config = self._load_config()
 
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
     def _load_config(self) -> Dict[str, Any]:
-        """Load configuration from file"""
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, 'r') as f:
-                    config = json.load(f)
-                # Merge with defaults (in case new fields were added)
-                full_config = self.DEFAULT_CONFIG.copy()
-                full_config.update(config)
-                return full_config
-            except Exception as e:
-                print(f"Warning: Could not load config from {self.config_path}: {e}")
-                print("Using default configuration.")
+        """
+        Load configuration from disk and merge with defaults.
 
-        # Config doesn't exist or failed to load - return defaults
-        return self.DEFAULT_CONFIG.copy()
+        Raises:
+            ValueError: If the file exists but contains invalid JSON.
+                        (Callers should catch this and report it clearly rather
+                        than silently falling back to defaults.)
+        """
+        if not os.path.exists(self.config_path):
+            return self.DEFAULT_CONFIG.copy()
+
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                on_disk = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"config.json is malformed and cannot be parsed.\n"
+                f"File: {self.config_path}\n"
+                f"Detail: {exc}\n\n"
+                "Fix or delete config.json, then restart."
+            ) from exc
+        except OSError as exc:
+            print(f"Warning: could not read {self.config_path}: {exc}. "
+                  "Using default configuration.")
+            return self.DEFAULT_CONFIG.copy()
+
+        # Merge: defaults first so new keys added to DEFAULT_CONFIG are picked up
+        merged = self.DEFAULT_CONFIG.copy()
+        merged.update(on_disk)
+        return merged
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+    def reload(self) -> None:
+        """Re-read config.json from disk. Useful when the file may have changed."""
+        self.config = self._load_config()
 
     def save_config(self) -> bool:
-        """Save configuration to file"""
+        """
+        Persist the current in-memory config to disk.
+
+        Returns:
+            True on success, False on failure (error is printed).
+        """
         try:
-            with open(self.config_path, 'w') as f:
+            with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
             return True
-        except Exception as e:
-            print(f"Error: Could not save config to {self.config_path}: {e}")
+        except OSError as exc:
+            print(f"Error: could not save config to {self.config_path}: {exc}")
             return False
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get configuration value"""
+        """Return a configuration value."""
         return self.config.get(key, default)
 
-    def set(self, key: str, value: Any) -> None:
-        """Set configuration value"""
+    def set_value(self, key: str, value: Any) -> None:
+        """
+        Set a configuration value in memory.
+        Call save_config() afterwards to persist.
+
+        Note: previously named set(), which shadowed the Python built-in.
+        """
         self.config[key] = value
 
+    # -------------------------------------------------------------------------
+    # MT5 path helpers
+    # -------------------------------------------------------------------------
     def get_mt5_files_path(self) -> str:
         """
-        Get MT5 Files directory path
-
-        Returns:
-            Path to MT5 Files directory
+        Return the validated MT5 Files directory path.
 
         Raises:
-            ValueError: If MT5 path is not configured
+            ValueError: If the path is not configured or does not exist on disk.
         """
         path = self.config.get("mt5_files_path", "")
 
         if not path:
             raise ValueError(
-                "MT5 Files path is not configured!\n\n"
-                "Please run the installer or manually create config.json with:\n"
-                '{\n'
-                '  "mt5_files_path": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\MetaQuotes\\\\Terminal\\\\HASH\\\\MQL5\\\\Files"\n'
-                '}'
+                "MT5 Files path is not configured.\n\n"
+                "Run setup_wizard.bat, or manually create config.json with:\n"
+                "{\n"
+                '  "mt5_files_path": "C:\\\\Users\\\\YourName\\\\AppData\\\\Roaming\\\\'
+                'MetaQuotes\\\\Terminal\\\\HASH\\\\MQL5\\\\Files"\n'
+                "}"
             )
 
         if not os.path.exists(path):
@@ -104,16 +156,16 @@ class ConfigManager:
 
     def set_mt5_files_path(self, path: str) -> bool:
         """
-        Set MT5 Files directory path
+        Validate, set, and immediately persist the MT5 Files directory path.
 
         Args:
-            path: Path to MT5 Files directory
+            path: Absolute path to the MT5 Files directory.
 
         Returns:
-            True if path is valid and saved, False otherwise
+            True if the path exists and was saved, False otherwise.
         """
         if not os.path.exists(path):
-            print(f"Error: Directory does not exist: {path}")
+            print(f"Error: directory does not exist: {path}")
             return False
 
         self.config["mt5_files_path"] = path
@@ -121,46 +173,62 @@ class ConfigManager:
 
     def auto_detect_mt5_path(self) -> Optional[str]:
         """
-        Attempt to auto-detect MT5 Files directory
+        Attempt to auto-detect the MT5 Files directory.
+
+        When multiple Terminal installations exist (e.g. demo + live accounts),
+        the one modified most recently is returned — that is most likely the
+        active one.
 
         Returns:
-            Path if found, None otherwise
+            Absolute path if found, None otherwise.
         """
-        import glob
-
-        # Check common locations
-        appdata = os.environ.get('APPDATA', '')
+        appdata = os.environ.get("APPDATA", "")
         if appdata:
-            # Look for MetaQuotes Terminal folders
-            terminal_base = os.path.join(appdata, 'MetaQuotes', 'Terminal')
+            terminal_base = os.path.join(appdata, "MetaQuotes", "Terminal")
             if os.path.exists(terminal_base):
-                # Look for any hash folder with MQL5\Files
-                pattern = os.path.join(terminal_base, '*', 'MQL5', 'Files')
-                matches = glob.glob(pattern)
+                matches = glob.glob(
+                    os.path.join(terminal_base, "*", "MQL5", "Files")
+                )
                 if matches:
-                    # Return the first match (most recent installation)
+                    # Sort by directory mtime descending — most recently used first
+                    matches.sort(key=os.path.getmtime, reverse=True)
                     return matches[0]
 
-        # Check Program Files
-        program_files = os.environ.get('PROGRAMFILES', 'C:\\Program Files')
-        mt5_path = os.path.join(program_files, 'MetaTrader 5', 'MQL5', 'Files')
-        if os.path.exists(mt5_path):
-            return mt5_path
+        # Fallback: standard Program Files installation
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        pf_path = os.path.join(program_files, "MetaTrader 5", "MQL5", "Files")
+        if os.path.exists(pf_path):
+            return pf_path
 
         return None
 
+    # -------------------------------------------------------------------------
+    # Model helpers
+    # -------------------------------------------------------------------------
     def get_default_models(self) -> list:
-        """Get default model types for training"""
-        return self.config.get("default_models", ["lstm", "gru", "transformer", "tcn", "lgbm"])
+        """
+        Return the configured default model types for training.
+
+        The fallback now references DEFAULT_CONFIG instead of a separate
+        hardcoded list that previously contradicted it.
+        """
+        return self.config.get(
+            "default_models", self.DEFAULT_CONFIG["default_models"]
+        )
 
     def get_available_models(self) -> list:
-        """Get all available model types"""
-        return self.config.get("available_models", ["lstm", "gru", "transformer", "tcn", "lgbm"])
+        """Return all available model types."""
+        return self.config.get(
+            "available_models", self.DEFAULT_CONFIG["available_models"]
+        )
 
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
     def print_config(self) -> None:
-        """Print current configuration"""
+        """Print the current configuration to stdout."""
         print("\n" + "=" * 50)
-        print("  GGTH Predictor Configuration v2.0")
+        print("  GGTH Predictor Configuration v2.1")
         print("=" * 50)
         print(f"Config file: {self.config_path}")
         print("\nSettings:")
@@ -169,12 +237,19 @@ class ConfigManager:
         print("=" * 50 + "\n")
 
 
-# Global config instance
-_config_instance = None
+# =============================================================================
+# Singleton
+# =============================================================================
+_config_instance: Optional[ConfigManager] = None
 
 
 def get_config() -> ConfigManager:
-    """Get global config instance (singleton pattern)"""
+    """
+    Return the global ConfigManager instance (singleton).
+
+    Call get_config().reload() if you need to pick up on-disk changes made
+    after the first call.
+    """
     global _config_instance
     if _config_instance is None:
         _config_instance = ConfigManager()
@@ -182,22 +257,40 @@ def get_config() -> ConfigManager:
 
 
 def get_mt5_files_path() -> str:
-    """Convenience function to get MT5 Files path"""
+    """Convenience wrapper: return the validated MT5 Files path."""
     return get_config().get_mt5_files_path()
 
 
+# =============================================================================
+# CLI utility
+# =============================================================================
 if __name__ == "__main__":
-    # Test/configure utility
     import argparse
 
-    parser = argparse.ArgumentParser(description="GGTH Predictor Configuration Utility v2.0")
-    parser.add_argument("--set-mt5-path", help="Set MT5 Files directory path")
-    parser.add_argument("--auto-detect", action="store_true", help="Auto-detect MT5 path")
-    parser.add_argument("--show", action="store_true", help="Show current configuration")
-    parser.add_argument("--list-models", action="store_true", help="List available model types")
+    parser = argparse.ArgumentParser(
+        description="GGTH Predictor Configuration Utility v2.1"
+    )
+    parser.add_argument("--set-mt5-path",  help="Set MT5 Files directory path")
+    parser.add_argument("--auto-detect",   action="store_true",
+                        help="Auto-detect MT5 path (picks most-recently-used terminal)")
+    parser.add_argument("--show",          action="store_true",
+                        help="Show current configuration")
+    parser.add_argument("--list-models",   action="store_true",
+                        help="List available model types")
+    parser.add_argument("--reload",        action="store_true",
+                        help="Force re-read of config.json (useful after manual edits)")
 
     args = parser.parse_args()
-    config = get_config()
+
+    try:
+        config = get_config()
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        raise SystemExit(1)
+
+    if args.reload:
+        config.reload()
+        print("Configuration reloaded from disk.")
 
     if args.set_mt5_path:
         if config.set_mt5_files_path(args.set_mt5_path):
@@ -210,17 +303,20 @@ if __name__ == "__main__":
         if path:
             print(f"Found MT5 installation at: {path}")
             response = input("Use this path? (y/n): ")
-            if response.lower() == 'y':
+            if response.lower() == "y":
                 if config.set_mt5_files_path(path):
                     print("✓ MT5 path configured successfully")
         else:
-            print("Could not auto-detect MT5 installation")
+            print("Could not auto-detect MT5 installation.")
 
     if args.list_models:
+        defaults = config.get_default_models()
         print("\nAvailable model types:")
         for model in config.get_available_models():
-            default = " (default)" if model in config.get_default_models() else ""
-            print(f"  - {model}{default}")
+            tag = " (default)" if model in defaults else ""
+            print(f"  - {model}{tag}")
 
-    if args.show or (not args.set_mt5_path and not args.auto_detect and not args.list_models):
+    if args.show or not any(
+        [args.set_mt5_path, args.auto_detect, args.list_models, args.reload]
+    ):
         config.print_config()
