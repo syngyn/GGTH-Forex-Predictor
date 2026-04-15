@@ -19,6 +19,6 @@ Also, included is an expert advisor that adheres to FIFO regulations for United 
 
 Everything is easy to do and can be done through the GUI.
 
-I'd also appreciate any feedback from anyone who tests or uses this. It would be very appredciated to get input for the upgraded system I'm going to be working on.
+It would be very appreciated to get any comments or other input for the upgraded system I'm going to be working on.
 
 Good Luck!!
