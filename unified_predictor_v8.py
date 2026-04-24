@@ -25,8 +25,19 @@ Previous v8.1 fixes:
 
 import sys
 import os
+import io
 import subprocess
 import warnings
+
+# ── Windows cp1252 fix ────────────────────────────────────────────────────────
+# The default Windows console encoding (cp1252) cannot encode Unicode arrows,
+# em-dashes, or other non-Latin characters used in log output.  Force UTF-8
+# before any print() call so we never get a UnicodeEncodeError that silently
+# kills regime detection or any other diagnostic path.
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
 import time
 import json
 import pickle
@@ -98,7 +109,7 @@ tf.config.run_functions_eagerly(False)
 
 # --- Helper Classes ---
 
-# KalmanFilter, TransformerBlock, AttentionLayer → see model_builders.py
+# KalmanFilter, TransformerBlock, AttentionLayer -> see model_builders.py
 
 # --- Main Predictor Class ---
 
@@ -285,13 +296,13 @@ class UnifiedLSTMPredictor:
             vol_long  = log_ret.iloc[-100:].std() if len(log_ret) >= 100 else vol_short
 
             # Normalised directional slope over the last 20 bars
-            # (mean log-return divided by short-term vol → a dimensionless Z-score)
+            # (mean log-return divided by short-term vol -> a dimensionless Z-score)
             mean_ret_short = log_ret.iloc[-20:].mean()
             trend_z = (mean_ret_short / vol_short) if vol_short > 0 else 0.0
 
             # Regime thresholds (calibrated for EURUSD H1; adjust if needed)
-            VOL_SPIKE_RATIO = 1.6   # vol_short > 1.6 × vol_long → volatile
-            TREND_Z_THRESH  = 1.2   # |trend_z| > 1.2 → trending
+            VOL_SPIKE_RATIO = 1.6   # vol_short > 1.6 × vol_long -> volatile
+            TREND_Z_THRESH  = 1.2   # |trend_z| > 1.2 -> trending
 
             if vol_short > VOL_SPIKE_RATIO * vol_long:
                 regime = 'volatile'
@@ -301,7 +312,7 @@ class UnifiedLSTMPredictor:
                 regime = 'ranging'
 
             print(f"   Regime detection: vol_ratio={vol_short/max(vol_long,1e-10):.2f}, "
-                  f"trend_z={trend_z:.2f} → {regime.upper()}")
+                  f"trend_z={trend_z:.2f} -> {regime.upper()}")
             return regime
 
         except Exception as e:
@@ -482,7 +493,7 @@ class UnifiedLSTMPredictor:
         perform_feature_selection().
 
         Args:
-            df_h1: H1 OHLCV DataFrame  (index = datetime, renamed tick_volume → volume)
+            df_h1: H1 OHLCV DataFrame  (index = datetime, renamed tick_volume -> volume)
             df_h4: H4 OHLCV DataFrame
             df_d1: D1 OHLCV DataFrame
 
@@ -566,7 +577,7 @@ class UnifiedLSTMPredictor:
         df['atr_14_h1']      = _atr(df, 14)
         df['volatility_14']  = df['log_return_1h'].rolling(14).std()
         df['volatility_30']  = df['log_return_1h'].rolling(30).std()
-        # Ratio of short-to-long vol: >1 → vol spike (regime signal)
+        # Ratio of short-to-long vol: >1 -> vol spike (regime signal)
         df['vol_ratio']      = df['volatility_14'] / (df['volatility_30'] + 1e-8)
 
         # ── Trend — SMA crossovers and price position ─────────────────────────
@@ -604,21 +615,20 @@ class UnifiedLSTMPredictor:
             spread_ma = df['spread'].rolling(20).mean()
             df['spread_ratio'] = df['spread'] / (spread_ma + 1e-8)
 
-        # ── H4 features (reindexed to H1 via forward-fill) ────────────────────
-        df['sma_20_h4']         = _reindex(df_h4['close'].rolling(20).mean())
-        df['sma_50_h4']         = _reindex(df_h4['close'].rolling(50).mean())
-        df['rsi_14_h4']         = _reindex(_rsi(df_h4['close'], 14))
-        df['atr_14_h4']         = _reindex(_atr(df_h4, 14))
+      # ── H4 features (shifted 1 period BEFORE reindexing to prevent look-ahead bias) ──
+        df['sma_20_h4']         = _reindex(df_h4['close'].rolling(20).mean().shift(1))
+        df['sma_50_h4']         = _reindex(df_h4['close'].rolling(50).mean().shift(1))
+        df['rsi_14_h4']         = _reindex(_rsi(df_h4['close'], 14).shift(1))
+        df['atr_14_h4']         = _reindex(_atr(df_h4, 14).shift(1))
         _, _, macd_hist_h4      = _macd(df_h4['close'])
-        df['macd_hist_h4']      = _reindex(macd_hist_h4)
-        df['close_sma20_h4_ratio'] = df['close'] / (_reindex(df_h4['close'].rolling(20).mean()) + 1e-8) - 1
+        df['macd_hist_h4']      = _reindex(macd_hist_h4.shift(1))
+        df['close_sma20_h4_ratio'] = df['close'] / (_reindex(df_h4['close'].rolling(20).mean().shift(1)) + 1e-8) - 1
 
-        # ── D1 features (reindexed to H1 via forward-fill) ────────────────────
-        df['sma_20_d1']            = _reindex(df_d1['close'].rolling(20).mean())
-        df['sma_50_d1']            = _reindex(df_d1['close'].rolling(50).mean())
-        df['rsi_14_d1']            = _reindex(_rsi(df_d1['close'], 14))
-        df['close_sma20_d1_ratio'] = df['close'] / (_reindex(df_d1['close'].rolling(20).mean()) + 1e-8) - 1
-
+        # ── D1 features (shifted 1 period BEFORE reindexing to prevent look-ahead bias) ──
+        df['sma_20_d1']            = _reindex(df_d1['close'].rolling(20).mean().shift(1))
+        df['sma_50_d1']            = _reindex(df_d1['close'].rolling(50).mean().shift(1))
+        df['rsi_14_d1']            = _reindex(_rsi(df_d1['close'], 14).shift(1))
+        df['close_sma20_d1_ratio'] = df['close'] / (_reindex(df_d1['close'].rolling(20).mean().shift(1)) + 1e-8) - 1
         # ── Time / session features ────────────────────────────────────────────
         # Complete cyclic pairs — a sin alone carries no phase information
         hour = df.index.hour
@@ -1289,13 +1299,16 @@ class UnifiedLSTMPredictor:
                     return False
 
                 if model_type in ['lstm', 'gru', 'transformer', 'tcn']:
+                    print(f"  Loading {model_name} from {os.path.basename(actual_model_path)}...")
                     self.models[model_name] = load_model(
                         actual_model_path,
                         custom_objects={
                             'TransformerBlock': TransformerBlock,
                             'AttentionLayer': AttentionLayer
-                        }
+                        },
+                        compile=False
                     )
+                    print(f"  Loaded {model_name}")
                 elif model_type == 'lgbm':
                     with open(actual_model_path, 'rb') as f:
                         self.models[model_name] = pickle.load(f)
@@ -1394,12 +1407,18 @@ class UnifiedLSTMPredictor:
                     if model_type in ['lstm', 'gru', 'transformer', 'tcn']:
                         model_path = self._get_model_path(model_type, model_index).replace('.keras', f'_{tf_name}.keras')
                         if os.path.exists(model_path):
+                            print(f"  Loading {model_name} from {os.path.basename(model_path)}...")
+                            # compile=False skips TF graph recompilation at load time.
+                            # Without it, Keras traces the full computation graph for every
+                            # custom-layer model, which can take minutes or hang entirely on
+                            # CPU.  We only need inference here — no gradients required.
                             models[model_name] = load_model(
                                 model_path,
                                 custom_objects={
                                     'TransformerBlock': TransformerBlock,
                                     'AttentionLayer': AttentionLayer
-                                }
+                                },
+                                compile=False
                             )
                             print(f"  Loaded {model_name}")
                         else:
@@ -1603,7 +1622,7 @@ class UnifiedLSTMPredictor:
 
         # Download fresh data.
         # H1 bar count must cover the longest warmup period (log_return_1w = 168 bars)
-        # plus the sequence lookback (60) plus a safety buffer → 500 is sufficient.
+        # plus the sequence lookback (60) plus a safety buffer -> 500 is sufficient.
         df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 500))
         df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 150))
         df_d1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_D1, 0,  75))
@@ -1846,9 +1865,17 @@ class UnifiedLSTMPredictor:
             if not self.load_model_assets_multitimeframe():
                 return
 
+        # Evaluate past predictions logged in the previous cycle and use the
+        # results to update per-timeframe ensemble weights.  These calls were
+        # only present in run_prediction_cycle (single-TF path) — their absence
+        # here meant multi-TF weights were permanently frozen at the equal
+        # initialisation value of 0.200 regardless of model accuracy.
+        self._evaluate_past_predictions()
+        self.update_ensemble_weights()
+
         # Download fresh data.
         # H1 bar count must cover the longest warmup period (log_return_1w = 168 bars)
-        # plus the sequence lookback (60) plus a safety buffer → 500 is sufficient.
+        # plus the sequence lookback (60) plus a safety buffer -> 500 is sufficient.
         # H4 and D1 only need enough for SMA-50 warmup.
         df_h1 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 500))
         df_h4 = pd.DataFrame(mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 150))
@@ -1888,6 +1915,12 @@ class UnifiedLSTMPredictor:
                 return
 
         predictions = {}
+        # Accumulate raw per-model price predictions per timeframe so they can
+        # be logged for future evaluation (feeds update_ensemble_weights).
+        # Previously this map was never built in the multi-TF path, so
+        # _log_prediction_for_evaluation could never be called and weights
+        # were permanently stuck at the equal-weight initialisation of 0.200.
+        ensemble_predictions_map: Dict[str, List[float]] = {}
 
         print("\nMaking predictions with timeframe-specific models...")
         for tf_name, models in self.models_by_timeframe.items():
@@ -1948,6 +1981,10 @@ class UnifiedLSTMPredictor:
             if not ensemble_preds:
                 print(f"ERROR: No valid predictions for {tf_name}")
                 continue
+
+            # Record raw per-model predictions for this timeframe so they can
+            # be logged at the end of the cycle and evaluated in the next cycle.
+            ensemble_predictions_map[tf_name] = ensemble_preds
 
             # Weighted ensemble average using per-timeframe weights (Fix 1 & 2).
             # Falls back to a plain mean only if the weight vector length mismatches
@@ -2045,6 +2082,13 @@ class UnifiedLSTMPredictor:
             and not uncertainty_veto
             and not agreement_veto
         )
+
+        # Log this cycle's raw predictions so the next cycle can evaluate them
+        # against the actual prices and feed the results into update_ensemble_weights.
+        # This call was missing from the multi-TF path entirely — without it
+        # pending_evaluations_*.json stays empty and weights can never evolve.
+        timeframes_steps = {"1H": 1, "4H": 4, "1D": 24}
+        self._log_prediction_for_evaluation(timeframes_steps, ensemble_predictions_map, current_price)
 
         # Save predictions and status
         status = {
@@ -2191,7 +2235,7 @@ class UnifiedLSTMPredictor:
             min_error = min(avg_errors) if avg_errors else 1e-8
             normalized_errors = [err / max(min_error, 1e-8) for err in avg_errors]
 
-            temperature = 2.0  # higher → more equal weights; lower → winner-takes-more
+            temperature = 2.0  # higher -> more equal weights; lower -> winner-takes-more
             exp_neg_errors = [np.exp(-err / temperature) for err in normalized_errors]
             total_exp = sum(exp_neg_errors)
 
