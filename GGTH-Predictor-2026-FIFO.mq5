@@ -5,11 +5,12 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Jason Rusk"
 #property link      "jason.w.rusk@gmail.com"
-#property version   "1.07"
+#property version   "1.08"
 #property description "GGTH ML Predictor EA - FIFO Compliant Edition"
 #property description "ML predictions (1H/4H/1D) with MA100 trend filter."
 #property description "10h max hold, 0-17h session, 15-pip averaging at 0.4 lots."
 #property description "v1.07: FIFO compliant - oldest-first close, hedge prevention."
+#property description "v1.08: Margin utilization guard - blocks new/avg positions above threshold."
 
 
 #include <Trade\Trade.mqh>
@@ -39,34 +40,38 @@ input int     InpMinPredictionPips=14;                      // Min prediction di
 
 //--- Position Sizing
 input group "=== Position Sizing ==="
-input int     InpMagicNumber=123456;                          // Magic Number (unique per EA instance)
+input int     InpMagicNumber=111111;                          // Magic Number (unique per EA instance)
 input ENUM_LOT_MODE InpLotMode=LOT_MODE_FIXED;              // Lot Size Mode
-input double  InpFixedLotSize=0.2;                          // Fixed Lot Size (if using Fixed mode)
+input double  InpFixedLotSize=0.01;                          // Fixed Lot Size (if using Fixed mode)
 input double  InpRiskPercent=1.0;                           // Risk per trade % (if using Risk mode)
-input bool    InpFIFOCompliant=false;                       // FIFO Compliant Mode (NFA/US brokers)
+input bool    InpFIFOCompliant=true;                       // FIFO Compliant Mode (NFA/US brokers)
 
 //--- Averaging Down Settings
 input group "=== Averaging Down Settings ==="
 input bool    InpUseAveragingDown=true;                     // Enable Averaging Down
-input double  InpAvgLevel1Lots=0.1;                         // Level 1: Lot Size
-input int     InpAvgLevel1Pips=1000;                        // Level 1: Pips Against Position (1000=disabled)
-input double  InpAvgLevel2Lots=0.4;                         // Level 2: Lot Size
+input double  InpAvgLevel1Lots=0.02;                         // Level 1: Lot Size
+input int     InpAvgLevel1Pips=35;                        // Level 1: Pips Against Position 
+input double  InpAvgLevel2Lots=0.02;                         // Level 2: Lot Size
 input int     InpAvgLevel2Pips=15;                          // Level 2: Pips Against Position
 input double  InpAvgLevel3Lots=0.3;                         // Level 3: Lot Size
 input int     InpAvgLevel3Pips=10000;                       // Level 3: Pips Against Position (10000=disabled)
+
+//--- Margin Risk Settings
+input group "=== Margin Risk Settings ==="
+input double  InpMaxMarginUsagePct=80.0;                    // Max Margin Usage % (blocks new positions above this)
 
 //--- Profit Protection Settings
 input group "=== Profit Protection Settings ==="
 input bool    InpUseProfitProtection=true;                  // Enable Profit Protection
 input int     InpMinPositionsForProtection=2;               // Min Positions to Trigger Protection
-input double  InpProfitTargetAmount=10;                     // Profit Target ($) to Close All
+input double  InpProfitTargetAmount=2;                     // Profit Target ($) to Close All
 
 //--- Max Hold Time Settings
 input group "=== Max Hold Time Settings ==="
 input bool    InpUseMaxHoldTime=true;                       // Enable Max Hold Time (replaces stop loss)
 input int     InpMaxHoldHours=10;                           // Max Hours to Hold Positions
 
-//--- Market Context Veto Settings (FIXED VERSION)
+//--- Market Context Veto Settings 
 input group "=== Market Context Veto Settings ==="
 input bool    InpUseMarketContextVeto=false;                // Use Market Context Veto System
 input double  InpVolatilitySpikeMultiplier=2.5;             // ATR Spike Threshold (2.5x = extreme)
@@ -1055,6 +1060,18 @@ void CGGTHExpert::CheckAveragingDown()
    if(!InpUseAveragingDown)
       return;
 
+//--- Check margin utilization - block averaging if margin usage exceeds threshold
+   double avg_margin_used  = AccountInfoDouble(ACCOUNT_MARGIN);
+   double avg_equity       = AccountInfoDouble(ACCOUNT_EQUITY);
+   double avg_margin_usage = (avg_equity > 0) ? (avg_margin_used / avg_equity * 100.0) : 0.0;
+   if(avg_margin_usage > InpMaxMarginUsagePct)
+     {
+      if(InpShowDebug)
+         Print("[MARGIN] Averaging blocked: margin usage ",DoubleToString(avg_margin_usage,1),
+               "% exceeds limit of ",DoubleToString(InpMaxMarginUsagePct,1),"%");
+      return;
+     }
+
    int position_count=CountOpenPositions();
 
 //--- If no positions, reset state
@@ -1794,6 +1811,18 @@ void CGGTHExpert::CheckForTradeSignal()
      {
       if(InpShowDebug)
          Print("Trade blocked by Market Context Veto");
+      return;
+     }
+
+//--- Check margin utilization - block new positions if margin usage exceeds threshold
+   double margin_used  = AccountInfoDouble(ACCOUNT_MARGIN);
+   double equity       = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin_usage = (equity > 0) ? (margin_used / equity * 100.0) : 0.0;
+   if(margin_usage > InpMaxMarginUsagePct)
+     {
+      if(InpShowDebug)
+         Print("[MARGIN] New trade blocked: margin usage ",DoubleToString(margin_usage,1),
+               "% exceeds limit of ",DoubleToString(InpMaxMarginUsagePct,1),"%");
       return;
      }
 
